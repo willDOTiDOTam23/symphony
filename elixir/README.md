@@ -121,6 +121,13 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.retry_active_issue_after_normal_exit: false` makes a normal worker exit a single-pass stop
+  for the current orchestrator lifetime instead of scheduling a continuation retry.
+- `agent.max_total_tokens` and `agent.max_runtime_ms` stop active runs without failure retry when
+  reported token usage or wall-clock runtime exceeds the configured limit.
+- `tracker.required_labels`, `tracker.excluded_labels`, and `tracker.issue_identifiers` narrow which
+  active issues are eligible for dispatch and running-state refreshes. Terminal cleanup still uses
+  terminal states without these routing filters.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

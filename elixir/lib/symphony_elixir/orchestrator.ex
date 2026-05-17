@@ -132,16 +132,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_normal_worker_exit(state, issue_id, running_entry, session_id)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -273,6 +264,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_running_issues(%State{} = state) do
+    state = reconcile_budget_limited_running_issues(state)
     state = reconcile_stalled_running_issues(state)
     running_ids = Map.keys(state.running)
 
@@ -306,6 +298,10 @@ defmodule SymphonyElixir.Orchestrator do
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
     reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
   end
+
+  @doc false
+  @spec reconcile_running_guards_for_test(term()) :: term()
+  def reconcile_running_guards_for_test(%State{} = state), do: reconcile_budget_limited_running_issues(state)
 
   @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
@@ -445,6 +441,27 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_normal_worker_exit(%State{} = state, issue_id, running_entry, session_id) do
+    if Config.settings!().agent.retry_active_issue_after_normal_exit do
+      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+      state
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(issue_id, 1, %{
+        identifier: running_entry.identifier,
+        delay_type: :continuation,
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      })
+    else
+      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; marking complete without continuation retry")
+
+      state
+      |> complete_issue(issue_id)
+      |> release_issue_claim(issue_id)
+    end
+  end
+
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
 
@@ -504,6 +521,90 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp last_activity_timestamp(_running_entry), do: nil
 
+  defp reconcile_budget_limited_running_issues(%State{} = state) do
+    agent = Config.settings!().agent
+
+    cond do
+      map_size(state.running) == 0 ->
+        state
+
+      is_nil(agent.max_total_tokens) and is_nil(agent.max_runtime_ms) ->
+        state
+
+      true ->
+        now = DateTime.utc_now()
+
+        Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+          stop_budget_limited_issue(state_acc, issue_id, running_entry, now, agent)
+        end)
+    end
+  end
+
+  defp stop_budget_limited_issue(state, issue_id, running_entry, now, agent) do
+    case budget_limit_reason(running_entry, now, agent) do
+      nil ->
+        state
+
+      reason ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        session_id = running_entry_session_id(running_entry)
+
+        Logger.warning("Issue exceeded Symphony guard: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} reason=#{budget_limit_log(reason)}; stopping without retry")
+
+        maybe_comment_budget_limit(issue_id, identifier, reason)
+
+        state
+        |> terminate_running_issue(issue_id, false)
+        |> complete_issue(issue_id)
+    end
+  end
+
+  defp budget_limit_reason(running_entry, now, agent) do
+    total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    elapsed_ms = running_milliseconds(Map.get(running_entry, :started_at), now)
+
+    cond do
+      is_integer(agent.max_total_tokens) and total_tokens > agent.max_total_tokens ->
+        {:max_total_tokens, total_tokens, agent.max_total_tokens}
+
+      is_integer(agent.max_runtime_ms) and elapsed_ms > agent.max_runtime_ms ->
+        {:max_runtime_ms, elapsed_ms, agent.max_runtime_ms}
+
+      true ->
+        nil
+    end
+  end
+
+  defp maybe_comment_budget_limit(issue_id, identifier, reason) do
+    body = """
+    ## Symphony Guard Stop
+
+    Symphony stopped this run without retrying because it exceeded `#{budget_limit_label(reason)}`.
+
+    - Issue: `#{identifier}`
+    - Observed: `#{budget_limit_observed(reason)}`
+    - Limit: `#{budget_limit_limit(reason)}`
+
+    Move the issue back to an active state or adjust the workflow budget if another run is needed.
+    """
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.debug("Unable to write Symphony guard comment for issue_id=#{issue_id}: #{inspect(reason)}")
+    end
+  end
+
+  defp budget_limit_label({label, _observed, _limit}), do: Atom.to_string(label)
+  defp budget_limit_observed({_label, observed, _limit}), do: to_string(observed)
+  defp budget_limit_limit({_label, _observed, limit}), do: to_string(limit)
+
+  defp budget_limit_log({label, observed, limit}) do
+    "#{label}=#{observed} limit=#{limit}"
+  end
+
   defp terminate_task(pid) when is_pid(pid) do
     case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
       :ok ->
@@ -553,12 +654,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed} = state,
+         %State{running: running, claimed: claimed, completed: completed} = state,
          active_states,
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !MapSet.member?(completed, issue.id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -1641,6 +1743,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp running_seconds(_started_at, _now), do: 0
+
+  defp running_milliseconds(%DateTime{} = started_at, %DateTime{} = now) do
+    max(0, DateTime.diff(now, started_at, :millisecond))
+  end
+
+  defp running_milliseconds(_started_at, _now), do: 0
 
   defp integer_like(value) when is_integer(value) and value >= 0, do: value
 

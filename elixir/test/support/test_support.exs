@@ -99,6 +99,9 @@ defmodule SymphonyElixir.TestSupport do
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+          tracker_required_labels: [],
+          tracker_excluded_labels: [],
+          tracker_issue_identifiers: [],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
@@ -107,6 +110,9 @@ defmodule SymphonyElixir.TestSupport do
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
+          max_total_tokens: nil,
+          max_runtime_ms: nil,
+          retry_active_issue_after_normal_exit: true,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -136,6 +142,9 @@ defmodule SymphonyElixir.TestSupport do
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
+    tracker_required_labels = Keyword.get(config, :tracker_required_labels)
+    tracker_excluded_labels = Keyword.get(config, :tracker_excluded_labels)
+    tracker_issue_identifiers = Keyword.get(config, :tracker_issue_identifiers)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
@@ -144,6 +153,9 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    max_total_tokens = Keyword.get(config, :max_total_tokens)
+    max_runtime_ms = Keyword.get(config, :max_runtime_ms)
+    retry_active_issue_after_normal_exit = Keyword.get(config, :retry_active_issue_after_normal_exit)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -174,6 +186,9 @@ defmodule SymphonyElixir.TestSupport do
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        "  required_labels: #{yaml_value(tracker_required_labels)}",
+        "  excluded_labels: #{yaml_value(tracker_excluded_labels)}",
+        "  issue_identifiers: #{yaml_value(tracker_issue_identifiers)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
@@ -184,6 +199,9 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        "  max_total_tokens: #{yaml_value(max_total_tokens)}",
+        "  max_runtime_ms: #{yaml_value(max_runtime_ms)}",
+        "  retry_active_issue_after_normal_exit: #{yaml_value(retry_active_issue_after_normal_exit)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

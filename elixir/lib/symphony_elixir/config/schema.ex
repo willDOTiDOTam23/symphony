@@ -326,7 +326,7 @@ defmodule SymphonyElixir.Config.Schema do
         workspace
         |> default_workspace_root(settings.workspace.root)
         |> expand_local_workspace_root()
-        |> default_turn_sandbox_policy()
+        |> default_turn_sandbox_policy(settings.codex.thread_sandbox)
     end
   end
 
@@ -340,7 +340,7 @@ defmodule SymphonyElixir.Config.Schema do
       _ ->
         workspace
         |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+        |> default_runtime_turn_sandbox_policy(settings.codex.thread_sandbox, opts)
     end
   end
 
@@ -533,7 +533,15 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_secret_value(_value), do: nil
 
-  defp default_turn_sandbox_policy(workspace) do
+  defp default_turn_sandbox_policy(_workspace, "danger-full-access") do
+    %{"type" => "dangerFullAccess"}
+  end
+
+  defp default_turn_sandbox_policy(_workspace, "read-only") do
+    %{"type" => "readOnly", "networkAccess" => false}
+  end
+
+  defp default_turn_sandbox_policy(workspace, _thread_sandbox) do
     %{
       "type" => "workspaceWrite",
       "writableRoots" => [workspace],
@@ -544,18 +552,18 @@ defmodule SymphonyElixir.Config.Schema do
     }
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
+  defp default_runtime_turn_sandbox_policy(workspace_root, thread_sandbox, opts) when is_binary(workspace_root) do
     if Keyword.get(opts, :remote, false) do
-      {:ok, default_turn_sandbox_policy(workspace_root)}
+      {:ok, default_turn_sandbox_policy(workspace_root, thread_sandbox)}
     else
       with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
            {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
-        {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
+        {:ok, default_turn_sandbox_policy(canonical_workspace_root, thread_sandbox)}
       end
     end
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
+  defp default_runtime_turn_sandbox_policy(workspace_root, _thread_sandbox, _opts) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
   end
 

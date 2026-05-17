@@ -1104,6 +1104,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "excludeTmpdirEnvVar" => false,
              "excludeSlashTmp" => false
            }
+
+    assert Schema.resolve_turn_sandbox_policy(%Schema{
+             codex: %Codex{thread_sandbox: "danger-full-access", turn_sandbox_policy: nil},
+             workspace: %Schema.Workspace{root: "/tmp/ignored"}
+           }) == %{"type" => "dangerFullAccess"}
+
+    assert Schema.resolve_turn_sandbox_policy(%Schema{
+             codex: %Codex{thread_sandbox: "read-only", turn_sandbox_policy: nil},
+             workspace: %Schema.Workspace{root: "/tmp/ignored"}
+           }) == %{"type" => "readOnly", "networkAccess" => false}
   end
 
   test "schema keeps workspace roots raw while sandbox helpers expand only for local use" do
@@ -1222,6 +1232,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                Schema.resolve_runtime_turn_sandbox_policy(settings, "")
 
       assert blank_workspace_policy == default_policy
+
+      danger_full_access_settings = %{
+        settings
+        | codex: %{settings.codex | thread_sandbox: "danger-full-access"}
+      }
+
+      assert {:ok, %{"type" => "dangerFullAccess"}} =
+               Schema.resolve_runtime_turn_sandbox_policy(danger_full_access_settings, issue_workspace)
 
       read_only_settings = %{
         settings

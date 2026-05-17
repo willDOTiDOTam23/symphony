@@ -35,6 +35,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       running: %{},
       completed: MapSet.new(),
+      guard_stopped: %{},
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
@@ -214,6 +215,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
+    state = reconcile_guard_stopped_issues(state)
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -386,6 +388,45 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_missing_running_issue_ids(state, _requested_issue_ids, _issues), do: state
 
+  defp reconcile_guard_stopped_issues(%State{guard_stopped: guard_stopped} = state)
+       when map_size(guard_stopped) == 0,
+       do: state
+
+  defp reconcile_guard_stopped_issues(%State{guard_stopped: guard_stopped} = state) do
+    issue_ids = Map.keys(guard_stopped)
+
+    case Tracker.fetch_issue_states_by_ids(issue_ids) do
+      {:ok, issues} ->
+        active_states = active_state_set()
+
+        active_issue_ids =
+          issues
+          |> Enum.flat_map(fn
+            %Issue{id: issue_id, state: state_name} when is_binary(issue_id) ->
+              if active_issue_state?(state_name, active_states), do: [issue_id], else: []
+
+            _ ->
+              []
+          end)
+          |> MapSet.new()
+
+        guard_stopped =
+          Enum.reduce(issue_ids, guard_stopped, fn issue_id, guard_stopped_acc ->
+            if MapSet.member?(active_issue_ids, issue_id) do
+              guard_stopped_acc
+            else
+              Map.delete(guard_stopped_acc, issue_id)
+            end
+          end)
+
+        %{state | guard_stopped: guard_stopped}
+
+      {:error, reason} ->
+        Logger.debug("Failed to refresh guard-stopped issue states: #{inspect(reason)}; keeping guard stops")
+        state
+    end
+  end
+
   defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do
       %{identifier: identifier} ->
@@ -556,6 +597,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> terminate_running_issue(issue_id, false)
         |> complete_issue(issue_id)
+        |> guard_stop_issue(issue_id, reason)
     end
   end
 
@@ -661,6 +703,7 @@ defmodule SymphonyElixir.Orchestrator do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !completed_issue_dispatch_blocked?(completed, issue.id) and
+      !guard_stopped_issue_dispatch_blocked?(state.guard_stopped, issue.id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -674,6 +717,25 @@ defmodule SymphonyElixir.Orchestrator do
     !Config.settings!().agent.retry_active_issue_after_normal_exit and
       MapSet.member?(completed, issue_id)
   end
+
+  defp guard_stopped_issue_dispatch_blocked?(guard_stopped, issue_id) when is_map(guard_stopped) do
+    case Map.get(guard_stopped, issue_id) do
+      nil -> false
+      reason -> budget_limit_still_blocks?(reason, Config.settings!().agent)
+    end
+  end
+
+  defp guard_stopped_issue_dispatch_blocked?(_guard_stopped, _issue_id), do: false
+
+  defp budget_limit_still_blocks?({:max_total_tokens, observed, _limit}, agent) do
+    is_integer(agent.max_total_tokens) and observed > agent.max_total_tokens
+  end
+
+  defp budget_limit_still_blocks?({:max_runtime_ms, observed, _limit}, agent) do
+    is_integer(agent.max_runtime_ms) and observed > agent.max_runtime_ms
+  end
+
+  defp budget_limit_still_blocks?(_reason, _agent), do: true
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -834,6 +896,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
+            guard_stopped: Map.delete(state.guard_stopped, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
 
@@ -875,6 +938,10 @@ defmodule SymphonyElixir.Orchestrator do
       | completed: MapSet.put(state.completed, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+  end
+
+  defp guard_stop_issue(%State{} = state, issue_id, reason) when is_binary(issue_id) do
+    %{state | guard_stopped: Map.put(state.guard_stopped, issue_id, reason)}
   end
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)

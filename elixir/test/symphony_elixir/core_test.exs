@@ -715,12 +715,65 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated_state.running, issue_id)
     refute MapSet.member?(updated_state.claimed, issue_id)
     assert MapSet.member?(updated_state.completed, issue_id)
+    assert updated_state.guard_stopped[issue_id] == {:max_total_tokens, 101, 100}
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
     refute Process.alive?(agent_pid)
 
     assert_receive {:memory_tracker_comment, ^issue_id, body}, 500
     assert body =~ "## Symphony Guard Stop"
     assert body =~ "max_total_tokens"
+  end
+
+  test "guard-stopped issue does not immediately dispatch in continuation mode" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_total_tokens: 100,
+      retry_active_issue_after_normal_exit: true
+    )
+
+    issue_id = "issue-budget-blocked"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-566",
+      title: "Budget blocked issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id]),
+      guard_stopped: %{issue_id => {:max_total_tokens, 101, 100}}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "guard-stopped issue can dispatch after budget is raised" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_total_tokens: 200,
+      retry_active_issue_after_normal_exit: true
+    )
+
+    issue_id = "issue-budget-raised"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-567",
+      title: "Budget raised issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id]),
+      guard_stopped: %{issue_id => {:max_total_tokens, 101, 100}}
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

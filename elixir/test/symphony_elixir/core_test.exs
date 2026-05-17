@@ -626,6 +626,50 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.retry_attempts, issue_id)
   end
 
+  test "completed issue can dispatch again when continuation retry mode is enabled" do
+    write_workflow_file!(Workflow.workflow_file_path(), retry_active_issue_after_normal_exit: true)
+
+    issue_id = "issue-completed-dispatch"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-564",
+      title: "Reopened completed issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id])
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "completed issue stays blocked in explicit single-pass mode" do
+    write_workflow_file!(Workflow.workflow_file_path(), retry_active_issue_after_normal_exit: false)
+
+    issue_id = "issue-completed-single-pass"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-565",
+      title: "Single pass completed issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id])
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "token guard stops running issue without retrying" do
     previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
 

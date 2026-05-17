@@ -660,7 +660,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
-      !MapSet.member?(completed, issue.id) and
+      !completed_issue_dispatch_blocked?(completed, issue.id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -669,6 +669,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp completed_issue_dispatch_blocked?(completed, issue_id) do
+    !Config.settings!().agent.retry_active_issue_after_normal_exit and
+      MapSet.member?(completed, issue_id)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)

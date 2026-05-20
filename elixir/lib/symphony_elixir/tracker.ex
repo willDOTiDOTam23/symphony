@@ -26,9 +26,7 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
-    with {:ok, issues} <- adapter().fetch_issue_states_by_ids(issue_ids) do
-      {:ok, filter_routable_issues(issues)}
-    end
+    adapter().fetch_issue_states_by_ids(issue_ids)
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}

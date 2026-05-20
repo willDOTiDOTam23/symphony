@@ -986,7 +986,7 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, []} = Client.fetch_issues_by_states([])
   end
 
-  test "tracker filters candidate and running-state reads by configured labels and identifiers" do
+  test "tracker filters candidates but keeps state-by-id reads unfiltered" do
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
 
     on_exit(fn ->
@@ -1022,10 +1022,10 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, [candidate]} = Tracker.fetch_candidate_issues()
     assert candidate.id == "allowed"
 
-    assert {:ok, [running_state]} =
+    assert {:ok, running_states} =
              Tracker.fetch_issue_states_by_ids(["allowed", "missing-label", "excluded", "wrong-id"])
 
-    assert running_state.id == "allowed"
+    assert Enum.map(running_states, & &1.id) == ["allowed", "missing-label", "excluded", "wrong-id"]
   end
 
   test "prompt builder renders issue and attempt values from workflow template" do

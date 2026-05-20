@@ -986,7 +986,7 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, []} = Client.fetch_issues_by_states([])
   end
 
-  test "tracker filters candidates but keeps state-by-id reads unfiltered" do
+  test "tracker filters candidates but marks unroutable state-by-id reads" do
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
 
     on_exit(fn ->
@@ -1025,7 +1025,71 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, running_states} =
              Tracker.fetch_issue_states_by_ids(["allowed", "missing-label", "excluded", "wrong-id"])
 
-    assert Enum.map(running_states, & &1.id) == ["allowed", "missing-label", "excluded", "wrong-id"]
+    assert Enum.map(running_states, &{&1.id, &1.assigned_to_worker}) == [
+             {"allowed", true},
+             {"missing-label", false},
+             {"excluded", false},
+             {"wrong-id", false}
+           ]
+  end
+
+  test "running issue that leaves tracker filters stops without disappearing from reconciliation" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony-ready", "pagekind-pro"],
+      tracker_excluded_labels: ["blocked"],
+      tracker_issue_identifiers: ["FRI-101"]
+    )
+
+    issue = %Issue{
+      id: "issue-routed-away",
+      identifier: "FRI-101",
+      title: "Lost required label",
+      state: "In Progress",
+      labels: ["symphony-ready"]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    assert {:ok, [refreshed_issue]} = Tracker.fetch_issue_states_by_ids([issue.id])
+    refute refreshed_issue.assigned_to_worker
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue.id => %{
+          pid: agent_pid,
+          ref: make_ref(),
+          identifier: issue.identifier,
+          issue: %{issue | labels: ["symphony-ready", "pagekind-pro"]},
+          session_id: "thread-routing-turn-1",
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue.id]),
+      completed: MapSet.new(),
+      guard_stopped: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([refreshed_issue], state)
+
+    refute Map.has_key?(updated_state.running, issue.id)
+    refute MapSet.member?(updated_state.claimed, issue.id)
+    refute Process.alive?(agent_pid)
   end
 
   test "prompt builder renders issue and attempt values from workflow template" do

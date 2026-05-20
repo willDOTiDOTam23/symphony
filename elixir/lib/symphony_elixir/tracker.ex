@@ -26,7 +26,9 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
-    adapter().fetch_issue_states_by_ids(issue_ids)
+    with {:ok, issues} <- adapter().fetch_issue_states_by_ids(issue_ids) do
+      {:ok, mark_routing_for_issues(issues)}
+    end
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
@@ -56,13 +58,33 @@ defmodule SymphonyElixir.Tracker do
 
     Enum.filter(issues, fn
       %Issue{} = issue ->
-        issue_matches_identifier_filter?(issue, tracker.issue_identifiers) and
-          issue_matches_required_labels?(issue, tracker.required_labels) and
-          issue_excludes_labels?(issue, tracker.excluded_labels)
+        issue_matches_tracker_filters?(issue, tracker)
 
       _ ->
         true
     end)
+  end
+
+  defp mark_routing_for_issues(issues) when is_list(issues) do
+    tracker = Config.settings!().tracker
+
+    Enum.map(issues, fn
+      %Issue{} = issue ->
+        if issue_matches_tracker_filters?(issue, tracker) do
+          issue
+        else
+          %{issue | assigned_to_worker: false}
+        end
+
+      issue ->
+        issue
+    end)
+  end
+
+  defp issue_matches_tracker_filters?(%Issue{} = issue, tracker) do
+    issue_matches_identifier_filter?(issue, tracker.issue_identifiers) and
+      issue_matches_required_labels?(issue, tracker.required_labels) and
+      issue_excludes_labels?(issue, tracker.excluded_labels)
   end
 
   defp issue_matches_identifier_filter?(_issue, []), do: true

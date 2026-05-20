@@ -16,7 +16,13 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.tracker.required_labels == []
+    assert config.tracker.excluded_labels == []
+    assert config.tracker.issue_identifiers == []
     assert config.agent.max_turns == 20
+    assert config.agent.max_total_tokens == nil
+    assert config.agent.max_runtime_ms == nil
+    assert config.agent.retry_active_issue_after_normal_exit == true
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -36,6 +42,31 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: [" Symphony-Ready ", "Pagekind-Pro", ""],
+      tracker_excluded_labels: ["blocked"],
+      tracker_issue_identifiers: [" fri-123 ", "FRI-124"],
+      max_total_tokens: 250_000,
+      max_runtime_ms: 900_000,
+      retry_active_issue_after_normal_exit: false
+    )
+
+    config = Config.settings!()
+    assert config.tracker.required_labels == ["symphony-ready", "pagekind-pro"]
+    assert config.tracker.excluded_labels == ["blocked"]
+    assert config.tracker.issue_identifiers == ["FRI-123", "FRI-124"]
+    assert config.agent.max_total_tokens == 250_000
+    assert config.agent.max_runtime_ms == 900_000
+    assert config.agent.retry_active_issue_after_normal_exit == false
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_total_tokens: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_total_tokens"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_runtime_ms: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_runtime_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -554,6 +585,197 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "normal worker exit can complete without scheduling continuation retry" do
+    write_workflow_file!(Workflow.workflow_file_path(), retry_active_issue_after_normal_exit: false)
+
+    issue_id = "issue-single-pass"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :SinglePassOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-562",
+      issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  test "completed issue can dispatch again when continuation retry mode is enabled" do
+    write_workflow_file!(Workflow.workflow_file_path(), retry_active_issue_after_normal_exit: true)
+
+    issue_id = "issue-completed-dispatch"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-564",
+      title: "Reopened completed issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id])
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "completed issue stays blocked in explicit single-pass mode" do
+    write_workflow_file!(Workflow.workflow_file_path(), retry_active_issue_after_normal_exit: false)
+
+    issue_id = "issue-completed-single-pass"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-565",
+      title: "Single pass completed issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id])
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "token guard stops running issue without retrying" do
+    previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_recipient, previous_memory_recipient)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_total_tokens: 100
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-budget"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-563",
+          issue: %Issue{id: issue_id, identifier: "MT-563", state: "In Progress"},
+          started_at: DateTime.utc_now(),
+          codex_total_tokens: 101
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      completed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.reconcile_running_guards_for_test(state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    assert MapSet.member?(updated_state.completed, issue_id)
+    assert updated_state.guard_stopped[issue_id] == {:max_total_tokens, 101, 100}
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    refute Process.alive?(agent_pid)
+
+    assert_receive {:memory_tracker_comment, ^issue_id, body}, 500
+    assert body =~ "## Symphony Guard Stop"
+    assert body =~ "max_total_tokens"
+  end
+
+  test "guard-stopped issue does not immediately dispatch in continuation mode" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_total_tokens: 100,
+      retry_active_issue_after_normal_exit: true
+    )
+
+    issue_id = "issue-budget-blocked"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-566",
+      title: "Budget blocked issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id]),
+      guard_stopped: %{issue_id => {:max_total_tokens, 101, 100}}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "guard-stopped issue can dispatch after budget is raised" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_total_tokens: 200,
+      retry_active_issue_after_normal_exit: true
+    )
+
+    issue_id = "issue-budget-raised"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-567",
+      title: "Budget raised issue",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new([issue_id]),
+      guard_stopped: %{issue_id => {:max_total_tokens, 101, 100}}
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
@@ -762,6 +984,112 @@ defmodule SymphonyElixir.CoreTest do
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])
+  end
+
+  test "tracker filters candidates but marks unroutable state-by-id reads" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony-ready", "pagekind-pro"],
+      tracker_excluded_labels: ["blocked"],
+      tracker_issue_identifiers: ["FRI-101", "FRI-102"]
+    )
+
+    allowed = %Issue{
+      id: "allowed",
+      identifier: "fri-101",
+      title: "Allowed",
+      state: "In Progress",
+      labels: ["Symphony-Ready", "pagekind-pro"]
+    }
+
+    missing_label = %{allowed | id: "missing-label", identifier: "FRI-102", labels: ["symphony-ready"]}
+    excluded = %{allowed | id: "excluded", identifier: "FRI-102", labels: ["symphony-ready", "pagekind-pro", "blocked"]}
+    wrong_identifier = %{allowed | id: "wrong-id", identifier: "FRI-103"}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      allowed,
+      missing_label,
+      excluded,
+      wrong_identifier
+    ])
+
+    assert {:ok, [candidate]} = Tracker.fetch_candidate_issues()
+    assert candidate.id == "allowed"
+
+    assert {:ok, running_states} =
+             Tracker.fetch_issue_states_by_ids(["allowed", "missing-label", "excluded", "wrong-id"])
+
+    assert Enum.map(running_states, &{&1.id, &1.assigned_to_worker}) == [
+             {"allowed", true},
+             {"missing-label", false},
+             {"excluded", false},
+             {"wrong-id", false}
+           ]
+  end
+
+  test "running issue that leaves tracker filters stops without disappearing from reconciliation" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony-ready", "pagekind-pro"],
+      tracker_excluded_labels: ["blocked"],
+      tracker_issue_identifiers: ["FRI-101"]
+    )
+
+    issue = %Issue{
+      id: "issue-routed-away",
+      identifier: "FRI-101",
+      title: "Lost required label",
+      state: "In Progress",
+      labels: ["symphony-ready"]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    assert {:ok, [refreshed_issue]} = Tracker.fetch_issue_states_by_ids([issue.id])
+    refute refreshed_issue.assigned_to_worker
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue.id => %{
+          pid: agent_pid,
+          ref: make_ref(),
+          identifier: issue.identifier,
+          issue: %{issue | labels: ["symphony-ready", "pagekind-pro"]},
+          session_id: "thread-routing-turn-1",
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue.id]),
+      completed: MapSet.new(),
+      guard_stopped: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([refreshed_issue], state)
+
+    refute Map.has_key?(updated_state.running, issue.id)
+    refute MapSet.member?(updated_state.claimed, issue.id)
+    refute Process.alive?(agent_pid)
   end
 
   test "prompt builder renders issue and attempt values from workflow template" do

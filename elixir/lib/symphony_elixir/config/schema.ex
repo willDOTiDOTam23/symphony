@@ -52,6 +52,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+      field(:required_labels, {:array, :string}, default: [])
+      field(:excluded_labels, {:array, :string}, default: [])
+      field(:issue_identifiers, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -59,7 +62,18 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :assignee,
+          :active_states,
+          :terminal_states,
+          :required_labels,
+          :excluded_labels,
+          :issue_identifiers
+        ],
         empty_values: []
       )
     end
@@ -132,6 +146,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:max_total_tokens, :integer)
+      field(:max_runtime_ms, :integer)
+      field(:retry_active_issue_after_normal_exit, :boolean, default: true)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -139,12 +156,22 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state,
+          :max_total_tokens,
+          :max_runtime_ms,
+          :retry_active_issue_after_normal_exit
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> validate_number(:max_total_tokens, greater_than: 0)
+      |> validate_number(:max_runtime_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -299,7 +326,7 @@ defmodule SymphonyElixir.Config.Schema do
         workspace
         |> default_workspace_root(settings.workspace.root)
         |> expand_local_workspace_root()
-        |> default_turn_sandbox_policy()
+        |> default_turn_sandbox_policy(settings.codex.thread_sandbox)
     end
   end
 
@@ -313,7 +340,7 @@ defmodule SymphonyElixir.Config.Schema do
       _ ->
         workspace
         |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+        |> default_runtime_turn_sandbox_policy(settings.codex.thread_sandbox, opts)
     end
   end
 
@@ -369,7 +396,10 @@ defmodule SymphonyElixir.Config.Schema do
     tracker = %{
       settings.tracker
       | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE")),
+        required_labels: normalize_filter_values(settings.tracker.required_labels, :lower),
+        excluded_labels: normalize_filter_values(settings.tracker.excluded_labels, :lower),
+        issue_identifiers: normalize_filter_values(settings.tracker.issue_identifiers, :upper)
     }
 
     workspace = %{
@@ -397,6 +427,30 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)
+
+  defp normalize_filter_values(values, casing) when is_list(values) do
+    values
+    |> Enum.map(&normalize_filter_value(&1, casing))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_filter_values(_values, _casing), do: []
+
+  defp normalize_filter_value(value, casing) when is_binary(value) do
+    value
+    |> String.trim()
+    |> case do
+      "" -> nil
+      normalized -> apply_filter_casing(normalized, casing)
+    end
+  end
+
+  defp normalize_filter_value(nil, _casing), do: nil
+  defp normalize_filter_value(value, casing), do: normalize_filter_value(to_string(value), casing)
+
+  defp apply_filter_casing(value, :lower), do: String.downcase(value)
+  defp apply_filter_casing(value, :upper), do: String.upcase(value)
 
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)
@@ -479,7 +533,15 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_secret_value(_value), do: nil
 
-  defp default_turn_sandbox_policy(workspace) do
+  defp default_turn_sandbox_policy(_workspace, "danger-full-access") do
+    %{"type" => "dangerFullAccess"}
+  end
+
+  defp default_turn_sandbox_policy(_workspace, "read-only") do
+    %{"type" => "readOnly", "networkAccess" => false}
+  end
+
+  defp default_turn_sandbox_policy(workspace, _thread_sandbox) do
     %{
       "type" => "workspaceWrite",
       "writableRoots" => [workspace],
@@ -490,18 +552,18 @@ defmodule SymphonyElixir.Config.Schema do
     }
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
+  defp default_runtime_turn_sandbox_policy(workspace_root, thread_sandbox, opts) when is_binary(workspace_root) do
     if Keyword.get(opts, :remote, false) do
-      {:ok, default_turn_sandbox_policy(workspace_root)}
+      {:ok, default_turn_sandbox_policy(workspace_root, thread_sandbox)}
     else
       with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
            {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
-        {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
+        {:ok, default_turn_sandbox_policy(canonical_workspace_root, thread_sandbox)}
       end
     end
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
+  defp default_runtime_turn_sandbox_policy(workspace_root, _thread_sandbox, _opts) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
   end
 

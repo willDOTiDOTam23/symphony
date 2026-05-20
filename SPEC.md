@@ -268,7 +268,8 @@ Fields:
 - `running` (map `issue_id -> running entry`)
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
-- `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
+- `completed` (set of issue IDs completed in the current orchestrator lifetime; used to avoid
+  immediately re-dispatching a single-pass issue that remains in an active tracker state)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
 
@@ -362,6 +363,17 @@ Fields:
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+- `required_labels` (list of strings)
+  - Default: `[]`
+  - When non-empty, candidate dispatch and running-state refreshes MUST only include issues that
+    have every configured label after lowercase normalization.
+- `excluded_labels` (list of strings)
+  - Default: `[]`
+  - Candidate dispatch and running-state refreshes MUST exclude issues with any configured label.
+- `issue_identifiers` (list of strings)
+  - Default: `[]`
+  - When non-empty, candidate dispatch and running-state refreshes MUST only include matching issue
+    identifiers after uppercase normalization.
 
 #### 5.3.2 `polling` (object)
 
@@ -423,6 +435,18 @@ Fields:
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
+- `max_total_tokens` (positive integer, OPTIONAL)
+  - If set, an active run whose reported total token count exceeds the limit MUST be stopped
+    without failure retry.
+- `max_runtime_ms` (positive integer, OPTIONAL)
+  - If set, an active run whose wall-clock runtime exceeds the limit MUST be stopped without
+    failure retry.
+- `retry_active_issue_after_normal_exit` (boolean)
+  - Default: `true`
+  - When `true`, a normally completed worker session for an issue still in an active state MAY be
+    retried as a continuation.
+  - When `false`, a normally completed worker session is treated as a complete single pass for the
+    current orchestrator lifetime.
 
 #### 5.3.6 `codex` (object)
 
@@ -576,6 +600,9 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
+- `tracker.required_labels`: list of strings, default `[]`
+- `tracker.excluded_labels`: list of strings, default `[]`
+- `tracker.issue_identifiers`: list of strings, default `[]`
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
@@ -587,10 +614,14 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `agent.max_total_tokens`: integer, OPTIONAL
+- `agent.max_runtime_ms`: integer, OPTIONAL
+- `agent.retry_active_issue_after_normal_exit`: boolean, default `true`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
-- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
+- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value; when omitted, defaults from
+  `codex.thread_sandbox`
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`

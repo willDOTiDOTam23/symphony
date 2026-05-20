@@ -538,6 +538,26 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "completed issue is not dispatch-eligible again in the same orchestrator lifetime" do
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      completed: MapSet.new(["done-1"]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "done-1",
+      identifier: "MT-1008",
+      title: "Already completed",
+      state: "Todo"
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "todo issue with terminal blockers remains dispatch-eligible" do
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
@@ -1084,6 +1104,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "excludeTmpdirEnvVar" => false,
              "excludeSlashTmp" => false
            }
+
+    assert Schema.resolve_turn_sandbox_policy(%Schema{
+             codex: %Codex{thread_sandbox: "danger-full-access", turn_sandbox_policy: nil},
+             workspace: %Schema.Workspace{root: "/tmp/ignored"}
+           }) == %{"type" => "dangerFullAccess"}
+
+    assert Schema.resolve_turn_sandbox_policy(%Schema{
+             codex: %Codex{thread_sandbox: "read-only", turn_sandbox_policy: nil},
+             workspace: %Schema.Workspace{root: "/tmp/ignored"}
+           }) == %{"type" => "readOnly", "networkAccess" => false}
   end
 
   test "schema keeps workspace roots raw while sandbox helpers expand only for local use" do
@@ -1202,6 +1232,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                Schema.resolve_runtime_turn_sandbox_policy(settings, "")
 
       assert blank_workspace_policy == default_policy
+
+      danger_full_access_settings = %{
+        settings
+        | codex: %{settings.codex | thread_sandbox: "danger-full-access"}
+      }
+
+      assert {:ok, %{"type" => "dangerFullAccess"}} =
+               Schema.resolve_runtime_turn_sandbox_policy(danger_full_access_settings, issue_workspace)
 
       read_only_settings = %{
         settings
